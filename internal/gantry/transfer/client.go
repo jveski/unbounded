@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
@@ -25,14 +26,18 @@ import (
 // Reuse a single Client across all peers - the underlying http.Transport
 // pools per-host connections internally.
 type Client struct {
-	hc          *http.Client
+	hc *http.Client
+	rangeHC     *http.Client
 	onBytesRead func(kind string, bytes int64)
 }
 
 // peerMaxReadFrameSize pairs with streamcopy.BufferSize. Large peer response
 // writes can then cross HTTP/2 in one frame instead of being split into the
 // RFC-default 16 KiB frames. The value is within HTTP/2's 16 KiB-16 MiB range.
-const peerMaxReadFrameSize = 1 << 20
+const (
+	peerMaxReadFrameSize       = 1 << 20
+	defaultRangeRequestTimeout = 10 * time.Second
+)
 
 // ClientOption tweaks Client construction.
 type ClientOption func(*clientOptions)
@@ -76,10 +81,24 @@ func NewClient(opts ...ClientOption) *Client {
 		fn(&o)
 	}
 
+	return &Client{
+		hc: &http.Client{
+			Transport: newPeerTransport(o),
+			Timeout:   o.requestTimeout,
+		},
+		rangeHC: &http.Client{
+			Transport: newPeerTransport(o),
+			Timeout:   defaultRangeRequestTimeout,
+		},
+		onBytesRead: o.onBytesRead,
+	}
+}
+
+func newPeerTransport(o clientOptions) *http.Transport {
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)
 
-	tr := &http.Transport{
+	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: o.dialTimeout}
 			return d.DialContext(ctx, network, addr)
@@ -89,14 +108,6 @@ func NewClient(opts ...ClientOption) *Client {
 			SendPingTimeout:  o.readIdleTimeout,
 			MaxReadFrameSize: peerMaxReadFrameSize,
 		},
-	}
-
-	return &Client{
-		hc: &http.Client{
-			Transport: tr,
-			Timeout:   o.requestTimeout,
-		},
-		onBytesRead: o.onBytesRead,
 	}
 }
 
@@ -194,6 +205,53 @@ func (c *Client) FetchFromPeer(ctx context.Context, peerAddr string, ref ifaces.
 	case resp.StatusCode == http.StatusNotFound:
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 		return nil, 0, "", &ifaces.ErrNotFound{Digest: ref.Digest}
+	default:
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		_ = resp.Body.Close()
+
+		return nil, 0, "", &ifaces.ErrPeerHTTPStatus{PeerAddr: peerAddr, StatusCode: resp.StatusCode, RetryAfter: retryAfter}
+	}
+}
+
+func (c *Client) FetchRangeFromPeer(ctx context.Context, peerAddr string, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, string, error) {
+	if _, err := httprange.New(requested.Start, requested.End); err != nil {
+		return nil, 0, "", err
+	}
+
+	url, err := buildPeerURL(peerAddr, ifaces.OriginRef{Digest: d, Kind: ifaces.KindBlob})
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	req.Header.Set(MirroredHeader, "1")
+	req.Header.Set("Accept", "application/octet-stream")
+	req.Header.Set("Range", requested.HeaderValue())
+	req.URL.Scheme = "http"
+
+	resp, err := c.rangeHC.Do(req)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("peer dial %s: %w", peerAddr, err)
+	}
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		size, err := httprange.ValidateResponse(requested, resp.Header.Get("Content-Range"), resp.ContentLength)
+		if err != nil {
+			_ = resp.Body.Close()
+
+			return nil, 0, "", &ifaces.ErrPeerProtocol{PeerAddr: peerAddr, Err: err}
+		}
+
+		return c.responseBody(resp, ifaces.KindBlob), size, resp.Header.Get("Content-Type"), nil
+	case http.StatusNotFound:
+		_ = resp.Body.Close()
+
+		return nil, 0, "", &ifaces.ErrNotFound{Digest: d}
 	default:
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 		_ = resp.Body.Close() //nolint:errcheck // best-effort body close
