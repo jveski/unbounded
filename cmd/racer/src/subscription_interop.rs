@@ -254,7 +254,7 @@ impl SubscriptionFixture {
         };
         snapshots
             .apply(Publication {
-                schema_version: 1,
+                schema_version: racer_control_wire::SCHEMA_VERSION,
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
